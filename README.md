@@ -1,6 +1,6 @@
 # ThreadPool
 
-This is the ThreadPool project.
+A simple C++11 and C++17 Thread Pool implementation.
 
 # Building and installing
 
