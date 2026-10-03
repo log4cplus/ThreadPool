@@ -32,6 +32,8 @@ Construction tests inject failure on the first, second, and fourth worker. They
 check that the original exception propagates, all started workers retire, and
 another pool can be constructed and used afterward. An oversized-construction
 case verifies that reserve fails before any thread creation is attempted.
+The zero-size case checks that construction starts one worker, tasks complete,
+resizing remains usable, and destruction drains queued work.
 
 Resizing tests cover the first failed worker creation, failure after partial growth,
 growth while a previous downsizing is still in progress, a reserve request above
@@ -40,9 +42,8 @@ Each injected failure must leave the pool usable for tasks, resizing, and
 destruction. Retirement and task checks use five-second deadlines; the outer
 timeout also bounds pool destruction. Checks remain enabled with `NDEBUG`.
 
-Pass `construct`, `construct-reserve`, `first`, `partial`, `downsizing`, `reserve`,
-or `tasks` as the executable's argument to run a single case. Before constructor
-failure cleanup, `construct` can terminate or hang during unwinding. Against the
-original resizing implementation, `first`
-asserts in a debug build; with assertions disabled, the invalid worker index can
-crash during shutdown.
+Pass `construct`, `construct-reserve`, `zero`, `first`, `partial`, `downsizing`,
+`reserve`, or `tasks` as the executable's argument to run a single case. Before
+constructor failure cleanup, `construct` can terminate or hang during unwinding.
+Against the original resizing implementation, `first` asserts in a debug build;
+with assertions disabled, the invalid worker index can crash during shutdown.

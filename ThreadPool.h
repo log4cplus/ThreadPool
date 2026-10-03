@@ -58,6 +58,7 @@ public:
             typename std::result_of<F&& (Args&&...)>::type;
 #endif
 
+    // A zero size requests one worker, matching set_pool_size(0).
     // If startup fails, retire any workers already started before propagating
     // the exception.
     explicit ThreadPool(std::size_t threads
@@ -129,13 +130,13 @@ private:
 
 // the constructor just launches some amount of workers
 inline ThreadPool::ThreadPool(std::size_t threads)
-    : pool_size(threads)
+    : pool_size((std::max)(threads, std::size_t(1)))
     , in_flight(0)
 {
     std::unique_lock<std::mutex> lock(this->queue_mutex);
-    this->workers.reserve(threads);
+    this->workers.reserve(pool_size);
     try {
-        for (std::size_t i = 0; i != threads; ++i)
+        for (std::size_t i = 0; i != pool_size; ++i)
             start_worker(i, lock);
     } catch (...) {
         // The destructor will not run if construction fails. Keep the members

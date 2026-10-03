@@ -227,6 +227,25 @@ void construction_reserve_failure()
     check_parallelism(recovered, 2);
 }
 
+void zero_worker_construction()
+{
+    const std::size_t before = tracker().snapshot().size();
+    std::atomic<unsigned> completed(0);
+    {
+        progschj::ThreadPool pool(0);
+        check_task(pool);
+        require(tracker().snapshot().size() == before + 1,
+            "zero construction did not start exactly one worker");
+        pool.set_pool_size(3);
+        check_parallelism(pool, 3);
+        pool.set_pool_size(0);
+        check_task(pool);
+        for (unsigned i = 0; i < 100; ++i)
+            pool.enqueue([&completed] { ++completed; });
+    }
+    require(completed == 100, "zero-constructed pool did not drain its tasks");
+}
+
 void first_creation_failure()
 {
     progschj::ThreadPool pool(1);
@@ -365,6 +384,7 @@ int main(int argc, char **argv)
     } tests[] = {
         {"construct", construction_failure},
         {"construct-reserve", construction_reserve_failure},
+        {"zero", zero_worker_construction},
         {"first", first_creation_failure},
         {"partial", partial_growth_failure},
         {"downsizing", growth_during_downsizing},
