@@ -72,20 +72,24 @@ public:
     void wait_until_nothing_in_flight();
     void set_queue_size_limit(std::size_t limit);
     // If growth fails, the previous target size is preserved and the
-    // exception propagates. Any partially added workers retire asynchronously.
-    // External callers first join previously retired workers and may block on
-    // their thread-local cleanup. Do not hold resources needed by that cleanup.
-    // Calls from this pool's workers skip joining, including during TLS cleanup.
+    // exception propagates. Partially added workers retire asynchronously,
+    // except that one may become the pool's background joiner. The joiner is
+    // otherwise started on the first shrink, before changing the target; if
+    // its startup fails, the previous target is preserved. Once started it
+    // stays until destruction and does not count toward the target size.
+    // Resizing never joins workers or waits for their thread-local cleanup.
+    // Blocked cleanup can delay reclamation of other retired workers.
     void set_pool_size(std::size_t limit);
     // Drain queued tasks and join all workers, including previously retired
-    // workers. Must be called outside this pool's workers, with no overlapping
-    // external member calls or resources held that worker cleanup needs.
+    // workers, and the joiner if started. Must be called outside this pool's
+    // threads, with no overlapping external member calls or resources held
+    // that worker cleanup needs.
     ~ThreadPool();
 
 private:
     void start_worker(std::size_t worker_number,
         std::unique_lock<std::mutex> const &lock);
-    void join_retired_workers(std::unique_lock<std::mutex> &lock);
+    void join_workers();
 
     template <typename F, typename... Args>
     auto enqueue_worker(bool, F&& f, Args&&... args) -> std::future<return_type<F, Args...>>;
@@ -96,15 +100,16 @@ private:
     struct worker_record
     {
         std::thread thread;
-        // Keep the ID available while another caller joins the thread handle.
-        std::thread::id id;
         bool retired = false;
-        bool joining = false;
+        bool become_joiner = false;
     };
     // Slots may be reused as soon as a worker leaves its task loop. Records
     // remain stable and owned until the corresponding thread has been joined.
     std::vector<worker_record *> workers;
     std::list<worker_record> worker_records;
+    // Only the joiner reclaims records once it has been started.
+    std::thread joiner;
+    std::size_t pending_retirements = 0;
     // target pool size
     std::size_t pool_size;
     // the task queue
@@ -118,6 +123,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition_producers;
     std::condition_variable condition_consumers;
+    std::condition_variable condition_joiner;
 
     std::mutex in_flight_mutex;
     std::condition_variable in_flight_condition;
@@ -235,9 +241,14 @@ inline ThreadPool::~ThreadPool()
     pool_size = 0;
     condition_consumers.notify_all();
     condition_producers.notify_all();
+    condition_joiner.notify_one();
+    const bool has_joiner = joiner.joinable();
     lock.unlock();
-    for (auto &worker : worker_records)
-        worker.thread.join();
+    if (has_joiner)
+        joiner.join();
+    else
+        for (auto &worker : worker_records)
+            worker.thread.join();
     assert(in_flight == 0);
 }
 
@@ -278,9 +289,6 @@ inline void ThreadPool::set_pool_size(std::size_t limit)
     if (stop)
         return;
 
-    join_retired_workers(lock);
-    // Joining releases queue_mutex. Another resizer may have changed the
-    // target or reused slots in the meantime, so read the current state now.
     std::size_t const old_size = pool_size;
     assert(this->workers.size() >= old_size);
 
@@ -293,48 +301,53 @@ inline void ThreadPool::set_pool_size(std::size_t limit)
         // it is possible that some of these are still running because
         // they have not stopped yet after a pool size reduction, such
         // workers will just keep running
-        for (std::size_t i = old_size; i != limit; ++i)
-            start_worker(i, lock);
+        try {
+            for (std::size_t i = old_size; i != limit; ++i)
+                start_worker(i, lock);
+        } catch (...) {
+            if (!joiner.joinable() && workers.size() > old_size) {
+                // Without a joiner no previous shrink has succeeded, so these
+                // are newly appended workers, still blocked on queue_mutex.
+                // Promote the last one without allocating or creating another
+                // thread while resources may be exhausted.
+                worker_record *worker = workers.back();
+                worker->become_joiner = true;
+                joiner = std::move(worker->thread);
+                workers.pop_back();
+            }
+            throw;
+        }
     }
+    else if (limit < old_size && !joiner.joinable())
+        joiner = std::thread([this] { join_workers(); });
     // Publish the target only after all required workers have started.
-    // On failure, new workers observe the old target and retire normally.
+    // On failure, surplus workers observe the old target (except a promoted
+    // joiner) and retire normally.
     pool_size = limit;
     if (pool_size < old_size)
         // notify all worker threads to start downsizing
         this->condition_consumers.notify_all();
 }
 
-inline void ThreadPool::join_retired_workers(std::unique_lock<std::mutex> &lock)
+inline void ThreadPool::join_workers()
 {
-    // A worker must not join itself or wait for another worker whose cleanup
-    // might depend on it. IDs stay registered throughout thread-local cleanup.
-    const std::thread::id caller = std::this_thread::get_id();
-    for (const auto &worker : worker_records)
-        if (worker.id == caller)
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    for (;;) {
+        condition_joiner.wait(lock, [this] {
+            return pending_retirements != 0 || (stop && worker_records.empty());
+        });
+        if (stop && worker_records.empty())
             return;
-
-    typedef std::list<worker_record>::iterator worker_iterator;
-    std::vector<worker_iterator> retired;
-    for (auto it = worker_records.begin(); it != worker_records.end(); ++it)
-        if (it->retired && !it->joining)
-            retired.push_back(it);
-    // All potentially throwing snapshot allocation precedes claiming records.
-    for (auto it : retired)
-        it->joining = true;
-
-    for (auto pending = retired.begin(); pending != retired.end(); ++pending)
-    {
+        auto record = std::find_if(worker_records.begin(), worker_records.end(),
+            [](const worker_record &worker) { return worker.retired; });
+        assert(record != worker_records.end());
+        --pending_retirements;
+        // Keep ownership until joining finishes, including native TLS cleanup.
+        // Workers and callers can keep using the pool while this join blocks.
         lock.unlock();
-        try {
-            (*pending)->thread.join();
-        } catch (...) {
-            lock.lock();
-            for (auto remaining = pending; remaining != retired.end(); ++remaining)
-                (*remaining)->joining = false;
-            throw;
-        }
+        record->thread.join();
         lock.lock();
-        worker_records.erase(*pending);
+        worker_records.erase(record);
     }
 }
 
@@ -354,8 +367,19 @@ inline void ThreadPool::start_worker(
     auto record = worker_records.emplace(worker_records.end());
     worker_record *const worker = &*record;
     auto worker_func =
-        [this, worker_number, worker]
+        [this, worker_number, worker, record]
         {
+            {
+                std::unique_lock<std::mutex> lock(this->queue_mutex);
+                if (worker->become_joiner) {
+                    // Its handle now belongs to joiner. Do not use the captured
+                    // record, worker pointer, or slot after removing this node.
+                    worker_records.erase(record);
+                    lock.unlock();
+                    join_workers();
+                    return;
+                }
+            }
             for(;;)
             {
                 std::function<void()> task;
@@ -373,10 +397,12 @@ inline void ThreadPool::start_worker(
                         || (!this->stop && pool_size < worker_number + 1))
                     {
                         // Retire independently of other slots. The thread
-                        // record stays owned until an external caller joins it.
+                        // record stays owned until the thread has been joined.
                         assert(this->workers[worker_number] == worker);
                         this->workers[worker_number] = nullptr;
                         worker->retired = true;
+                        ++pending_retirements;
+                        condition_joiner.notify_one();
                         // downsize the workers vector as much as possible
                         while (this->workers.size() > pool_size
                              && !this->workers.back())
@@ -412,7 +438,6 @@ inline void ThreadPool::start_worker(
         worker_records.erase(record);
         throw;
     }
-    worker->id = worker->thread.get_id();
     if (worker_number < this->workers.size())
         this->workers[worker_number] = worker;
     else

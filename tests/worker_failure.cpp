@@ -8,6 +8,29 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <new>
+
+// Fail only allocations on the resizing caller. pthread_create bookkeeping is
+// excluded below, so exceptions cannot cross the interposed C API boundary.
+thread_local std::size_t allocation_countdown = 0;
+thread_local unsigned allocation_rejections = 0;
+
+__attribute__((noinline)) void *operator new(std::size_t size)
+{
+    if (allocation_rejections
+        || (allocation_countdown && --allocation_countdown == 0)) {
+        ++allocation_rejections;
+        throw std::bad_alloc();
+    }
+    if (void *p = std::malloc(size ? size : 1))
+        return p;
+    throw std::bad_alloc();
+}
+
+// Keep replacement allocation functions out of line so GCC does not diagnose
+// their malloc/free implementation as mismatched new/delete at call sites.
+__attribute__((noinline)) void operator delete(void *p) noexcept { std::free(p); }
+__attribute__((noinline)) void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -213,7 +236,7 @@ void construction_reserve_failure()
         // Bound the unfixed implementation without exhausting real resources.
         FailCreation failure(1);
         try {
-            progschj::ThreadPool pool(std::vector<std::thread>().max_size() + 1);
+            progschj::ThreadPool pool(std::vector<void *>().max_size() + 1);
         } catch (const std::length_error &) {
             rejected = true;
         } catch (...) {
@@ -265,7 +288,7 @@ void partial_growth_failure()
     fail_growth(pool, 4, 2);
     auto workers = tracker().snapshot();
     require(workers.size() == before + 1, "expected one partially added worker");
-    tracker().wait_finished(workers.back());
+    // The partially started worker becomes the joiner until pool destruction.
     check_task(pool);
     pool.set_pool_size(4);
     check_parallelism(pool, 4);
@@ -289,7 +312,7 @@ void growth_during_downsizing()
     fail_growth(pool, 4);
     require(tracker().attempt_count() == attempts + 1,
         "growth did not reuse the workers still executing");
-    require(tracker().snapshot().size() == workers.size(),
+    require(tracker().snapshot().size() == workers.size() + 1,
         "growth unexpectedly created another worker");
     gate->release();
     for (auto &future : futures)
@@ -311,7 +334,7 @@ void reserve_failure()
         // real system resources when it misses the reserve check.
         FailCreation failure(1);
         try {
-            pool.set_pool_size(std::vector<std::thread>().max_size() + 1);
+            pool.set_pool_size(std::vector<void *>().max_size() + 1);
         } catch (const std::length_error &) {
             rejected = true;
         } catch (...) {
@@ -324,6 +347,66 @@ void reserve_failure()
     check_task(pool);
     pool.set_pool_size(3);
     check_parallelism(pool, 3);
+}
+
+void allocation_failure()
+{
+    {
+        progschj::ThreadPool pool(3);
+        const std::size_t attempts = tracker().attempt_count();
+        allocation_countdown = 1;
+        bool rejected = false;
+        try {
+            pool.set_pool_size(1);
+        } catch (const std::bad_alloc &) {
+            rejected = true;
+        }
+        const unsigned rejections = allocation_rejections;
+        allocation_countdown = 0;
+        allocation_rejections = 0;
+        require(rejected && rejections == 1, "helper allocation failure was not propagated");
+        require(tracker().attempt_count() == attempts,
+            "helper creation followed failed allocation");
+        check_parallelism(pool, 3);
+        pool.set_pool_size(1);
+        check_task(pool);
+    }
+    unsigned before_start = 0, after_start = 0;
+    // Cover reserve, record allocation, and thread-state allocation, including
+    // failures after one or more workers have started. Further allocations
+    // keep failing until the resize has propagated its original exception.
+    for (std::size_t nth = 1; nth <= 12; ++nth) {
+        progschj::ThreadPool pool(1);
+        const std::size_t before = tracker().snapshot().size();
+        allocation_countdown = nth;
+        bool rejected = false;
+        try {
+            pool.set_pool_size(4);
+        } catch (const std::bad_alloc &) {
+            rejected = true;
+        }
+        const unsigned rejections = allocation_rejections;
+        allocation_countdown = 0;
+        allocation_rejections = 0;
+        if (rejected) {
+            require(rejections == 1, "failure recovery attempted another allocation");
+            auto workers = tracker().snapshot();
+            if (workers.size() == before)
+                ++before_start;
+            else {
+                ++after_start;
+                // The last addition becomes the helper; earlier ones retire.
+                for (std::size_t i = before; i + 1 < workers.size(); ++i)
+                    tracker().wait_finished(workers[i]);
+            }
+            check_task(pool);
+        }
+        pool.set_pool_size(4);
+        check_parallelism(pool, 4);
+        pool.set_pool_size(1);
+        check_task(pool);
+    }
+    require(before_start && after_start, "allocation injection missed partial growth");
 }
 
 void resizing_with_tasks()
@@ -360,9 +443,13 @@ extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attribute
     if (!track_creation)
         return real_create(thread, attributes, function, argument);
 
+    const std::size_t saved_countdown = allocation_countdown;
+    allocation_countdown = 0;
     std::lock_guard<std::mutex> lock(tracker().mutex);
-    if (++tracker().attempts == tracker().fail_at)
+    if (++tracker().attempts == tracker().fail_at) {
+        allocation_countdown = saved_countdown;
         return EAGAIN;
+    }
 
     auto worker = std::make_shared<Worker>();
     std::unique_ptr<Start> start(new Start{function, argument, worker});
@@ -372,6 +459,7 @@ extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attribute
         start.release();
     else
         tracker().workers.pop_back();
+    allocation_countdown = saved_countdown;
     return result;
 }
 
@@ -389,6 +477,7 @@ int main(int argc, char **argv)
         {"partial", partial_growth_failure},
         {"downsizing", growth_during_downsizing},
         {"reserve", reserve_failure},
+        {"allocation", allocation_failure},
         {"tasks", resizing_with_tasks}
     };
     bool ran = false;
