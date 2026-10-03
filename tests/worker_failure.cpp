@@ -397,8 +397,7 @@ int main(int argc, char **argv)
             continue;
         ran = true;
         test.run();
-        // Pool destruction detaches workers. Keep test bookkeeping alive
-        // until their entry functions have actually returned.
+        // Also keep bookkeeping alive when testing older, detaching revisions.
         for (const auto &worker : tracker().snapshot())
             tracker().wait_finished(worker);
         std::printf("PASS: %s\n", test.name);

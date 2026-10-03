@@ -26,6 +26,7 @@
 #define THREAD_POOL_H_7ea1ee6b_4f17_4c09_b76b_3d44e102400c
 
 #include <vector>
+#include <list>
 #include <queue>
 #include <memory>
 #include <thread>
@@ -59,7 +60,7 @@ public:
 #endif
 
     // A zero size requests one worker, matching set_pool_size(0).
-    // If startup fails, retire any workers already started before propagating
+    // If startup fails, join any workers already started before propagating
     // the exception.
     explicit ThreadPool(std::size_t threads
         = (std::max)(2u, std::thread::hardware_concurrency()));
@@ -72,12 +73,19 @@ public:
     void set_queue_size_limit(std::size_t limit);
     // If growth fails, the previous target size is preserved and the
     // exception propagates. Any partially added workers retire asynchronously.
+    // External callers first join previously retired workers and may block on
+    // their thread-local cleanup. Do not hold resources needed by that cleanup.
+    // Calls from this pool's workers skip joining, including during TLS cleanup.
     void set_pool_size(std::size_t limit);
+    // Drain queued tasks and join all workers, including previously retired
+    // workers. Must be called outside this pool's workers, with no overlapping
+    // external member calls or resources held that worker cleanup needs.
     ~ThreadPool();
 
 private:
     void start_worker(std::size_t worker_number,
         std::unique_lock<std::mutex> const &lock);
+    void join_retired_workers(std::unique_lock<std::mutex> &lock);
 
     template <typename F, typename... Args>
     auto enqueue_worker(bool, F&& f, Args&&... args) -> std::future<return_type<F, Args...>>;
@@ -85,8 +93,18 @@ private:
     template <typename T>
     static std::future<T> make_exception_future (std::exception_ptr ex_ptr);
 
-    // need to keep track of threads so we can join them
-    std::vector< std::thread > workers;
+    struct worker_record
+    {
+        std::thread thread;
+        // Keep the ID available while another caller joins the thread handle.
+        std::thread::id id;
+        bool retired = false;
+        bool joining = false;
+    };
+    // Slots may be reused as soon as a worker leaves its task loop. Records
+    // remain stable and owned until the corresponding thread has been joined.
+    std::vector<worker_record *> workers;
+    std::list<worker_record> worker_records;
     // target pool size
     std::size_t pool_size;
     // the task queue
@@ -140,11 +158,13 @@ inline ThreadPool::ThreadPool(std::size_t threads)
             start_worker(i, lock);
     } catch (...) {
         // The destructor will not run if construction fails. Keep the members
-        // alive until all started workers have stopped accessing the pool.
+        // alive through complete thread exit, including thread-local cleanup.
         stop = true;
         pool_size = 0;
         condition_consumers.notify_all();
-        condition_consumers.wait(lock, [this]{ return this->workers.empty(); });
+        lock.unlock();
+        for (auto &worker : worker_records)
+            worker.thread.join();
         throw;
     }
 }
@@ -215,7 +235,9 @@ inline ThreadPool::~ThreadPool()
     pool_size = 0;
     condition_consumers.notify_all();
     condition_producers.notify_all();
-    condition_consumers.wait(lock, [this]{ return this->workers.empty(); });
+    lock.unlock();
+    for (auto &worker : worker_records)
+        worker.thread.join();
     assert(in_flight == 0);
 }
 
@@ -256,6 +278,9 @@ inline void ThreadPool::set_pool_size(std::size_t limit)
     if (stop)
         return;
 
+    join_retired_workers(lock);
+    // Joining releases queue_mutex. Another resizer may have changed the
+    // target or reused slots in the meantime, so read the current state now.
     std::size_t const old_size = pool_size;
     assert(this->workers.size() >= old_size);
 
@@ -279,14 +304,57 @@ inline void ThreadPool::set_pool_size(std::size_t limit)
         this->condition_consumers.notify_all();
 }
 
+inline void ThreadPool::join_retired_workers(std::unique_lock<std::mutex> &lock)
+{
+    // A worker must not join itself or wait for another worker whose cleanup
+    // might depend on it. IDs stay registered throughout thread-local cleanup.
+    const std::thread::id caller = std::this_thread::get_id();
+    for (const auto &worker : worker_records)
+        if (worker.id == caller)
+            return;
+
+    typedef std::list<worker_record>::iterator worker_iterator;
+    std::vector<worker_iterator> retired;
+    for (auto it = worker_records.begin(); it != worker_records.end(); ++it)
+        if (it->retired && !it->joining)
+            retired.push_back(it);
+    // All potentially throwing snapshot allocation precedes claiming records.
+    for (auto it : retired)
+        it->joining = true;
+
+    for (auto pending = retired.begin(); pending != retired.end(); ++pending)
+    {
+        lock.unlock();
+        try {
+            (*pending)->thread.join();
+        } catch (...) {
+            lock.lock();
+            for (auto remaining = pending; remaining != retired.end(); ++remaining)
+                (*remaining)->joining = false;
+            throw;
+        }
+        lock.lock();
+        worker_records.erase(*pending);
+    }
+}
+
 inline void ThreadPool::start_worker(
     std::size_t worker_number, std::unique_lock<std::mutex> const &lock)
 {
     assert(lock.owns_lock() && lock.mutex() == &this->queue_mutex);
+    (void)lock;
     assert(worker_number <= this->workers.size());
 
+    // A worker still executing after downsizing can keep its existing slot.
+    if (worker_number < workers.size() && workers[worker_number])
+        return;
+
+    // Allocate ownership before creating a joinable thread. Slot capacity was
+    // reserved by the caller, so publishing the new worker cannot allocate.
+    auto record = worker_records.emplace(worker_records.end());
+    worker_record *const worker = &*record;
     auto worker_func =
-        [this, worker_number]
+        [this, worker_number, worker]
         {
             for(;;)
             {
@@ -304,15 +372,15 @@ inline void ThreadPool::start_worker(
                     if ((this->stop && this->tasks.empty())
                         || (!this->stop && pool_size < worker_number + 1))
                     {
-                        // detach this worker, effectively marking it stopped
-                        this->workers[worker_number].detach();
+                        // Retire independently of other slots. The thread
+                        // record stays owned until an external caller joins it.
+                        assert(this->workers[worker_number] == worker);
+                        this->workers[worker_number] = nullptr;
+                        worker->retired = true;
                         // downsize the workers vector as much as possible
                         while (this->workers.size() > pool_size
-                             && !this->workers.back().joinable())
+                             && !this->workers.back())
                             this->workers.pop_back();
-                        // if this is was last worker, notify the destructor
-                        if (this->workers.empty())
-                            this->condition_consumers.notify_all();
                         return;
                     }
                     else if (!this->tasks.empty())
@@ -338,14 +406,17 @@ inline void ThreadPool::start_worker(
             }
         };
 
-    if (worker_number < this->workers.size()) {
-        std::thread & worker = this->workers[worker_number];
-        // start only if not already running
-        if (!worker.joinable()) {
-            worker = std::thread(worker_func);
-        }
-    } else
-        this->workers.push_back(std::thread(worker_func));
+    try {
+        worker->thread = std::thread(worker_func);
+    } catch (...) {
+        worker_records.erase(record);
+        throw;
+    }
+    worker->id = worker->thread.get_id();
+    if (worker_number < this->workers.size())
+        this->workers[worker_number] = worker;
+    else
+        this->workers.push_back(worker);
 }
 
 template <typename T>
