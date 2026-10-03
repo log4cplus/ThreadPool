@@ -67,6 +67,8 @@ public:
     void wait_until_empty();
     void wait_until_nothing_in_flight();
     void set_queue_size_limit(std::size_t limit);
+    // If growth fails, the previous target size is preserved and the
+    // exception propagates. Any partially added workers retire asynchronously.
     void set_pool_size(std::size_t limit);
     ~ThreadPool();
 
@@ -243,17 +245,22 @@ inline void ThreadPool::set_pool_size(std::size_t limit)
     std::size_t const old_size = pool_size;
     assert(this->workers.size() >= old_size);
 
-    pool_size = limit;
-    if (pool_size > old_size)
+    if (limit > old_size)
     {
+        // Allocate before starting threads so insertion cannot fail while
+        // holding a newly created, joinable thread.
+        this->workers.reserve(limit);
         // create new worker threads
         // it is possible that some of these are still running because
         // they have not stopped yet after a pool size reduction, such
         // workers will just keep running
-        for (std::size_t i = old_size; i != pool_size; ++i)
+        for (std::size_t i = old_size; i != limit; ++i)
             start_worker(i, lock);
     }
-    else if (pool_size < old_size)
+    // Publish the target only after all required workers have started.
+    // On failure, new workers observe the old target and retire normally.
+    pool_size = limit;
+    if (pool_size < old_size)
         // notify all worker threads to start downsizing
         this->condition_consumers.notify_all();
 }
