@@ -58,6 +58,8 @@ public:
             typename std::result_of<F&& (Args&&...)>::type;
 #endif
 
+    // If startup fails, retire any workers already started before propagating
+    // the exception.
     explicit ThreadPool(std::size_t threads
         = (std::max)(2u, std::thread::hardware_concurrency()));
     template <typename F, typename... Args>
@@ -131,8 +133,19 @@ inline ThreadPool::ThreadPool(std::size_t threads)
     , in_flight(0)
 {
     std::unique_lock<std::mutex> lock(this->queue_mutex);
-    for (std::size_t i = 0; i != threads; ++i)
-        start_worker(i, lock);
+    this->workers.reserve(threads);
+    try {
+        for (std::size_t i = 0; i != threads; ++i)
+            start_worker(i, lock);
+    } catch (...) {
+        // The destructor will not run if construction fails. Keep the members
+        // alive until all started workers have stopped accessing the pool.
+        stop = true;
+        pool_size = 0;
+        condition_consumers.notify_all();
+        condition_consumers.wait(lock, [this]{ return this->workers.empty(); });
+        throw;
+    }
 }
 
 // add new work item to the pool and block if the queue is full

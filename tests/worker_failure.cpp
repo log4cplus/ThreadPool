@@ -1,4 +1,4 @@
-// Standalone Linux regression tests. See README.md for build instructions.
+// Standalone Linux worker-failure tests. See README.md for build instructions.
 #include "ThreadPool.h"
 
 #include <cerrno>
@@ -175,6 +175,58 @@ void check_parallelism(progschj::ThreadPool &pool, std::size_t count)
         get_ready(future);
 }
 
+void construction_failure()
+{
+    // Cover no workers started, one worker started, and several started.
+    const std::size_t failures[] = {1, 2, 4};
+    for (std::size_t nth : failures) {
+        const std::size_t before = tracker().snapshot().size();
+        bool rejected = false;
+        {
+            FailCreation failure(nth);
+            try {
+                progschj::ThreadPool pool(4);
+            } catch (const std::system_error &error) {
+                require(error.code() == std::errc::resource_unavailable_try_again,
+                    "constructor did not propagate the thread creation error");
+                rejected = true;
+            }
+        }
+        require(rejected, "constructor did not throw the injected error");
+        auto workers = tracker().snapshot();
+        require(workers.size() == before + nth - 1,
+            "unexpected number of workers started before construction failed");
+        for (std::size_t i = before; i < workers.size(); ++i)
+            tracker().wait_finished(workers[i]);
+
+        // The exception must be recoverable, including building another pool.
+        progschj::ThreadPool recovered(2);
+        check_parallelism(recovered, 2);
+    }
+}
+
+void construction_reserve_failure()
+{
+    const std::size_t attempts = tracker().attempt_count();
+    bool rejected = false;
+    {
+        // Bound the unfixed implementation without exhausting real resources.
+        FailCreation failure(1);
+        try {
+            progschj::ThreadPool pool(std::vector<std::thread>().max_size() + 1);
+        } catch (const std::length_error &) {
+            rejected = true;
+        } catch (...) {
+            require(false, "oversized construction did not fail in reserve");
+        }
+    }
+    require(rejected, "oversized construction was not rejected");
+    require(tracker().attempt_count() == attempts,
+        "worker creation happened before construction reserve failed");
+    progschj::ThreadPool recovered(2);
+    check_parallelism(recovered, 2);
+}
+
 void first_creation_failure()
 {
     progschj::ThreadPool pool(1);
@@ -311,6 +363,8 @@ int main(int argc, char **argv)
         const char *name;
         void (*run)();
     } tests[] = {
+        {"construct", construction_failure},
+        {"construct-reserve", construction_reserve_failure},
         {"first", first_creation_failure},
         {"partial", partial_growth_failure},
         {"downsizing", growth_during_downsizing},
