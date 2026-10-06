@@ -32,6 +32,8 @@ The helper accepts `v140`, `v141`, `v142`, `v143`, and `v145`; select `Clang`
 instead of `MSVC` to use the bundled Visual Studio clang-cl. It expects Visual
 Studio 2022 for v140-v143 or Visual Studio 2026 for v145. C++23 on native MSVC
 requires `/std:c++23preview`; configuration fails if the switch is unsupported.
+The v140 environment selects Windows SDK 10.0.19041.0, installing it if needed;
+newer SDK headers use compiler intrinsics that toolset does not support.
 
 ## Continuous integration
 
