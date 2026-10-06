@@ -203,15 +203,27 @@ void drain()
     for (auto &count : counts)
         count.store(0);
     std::vector<std::future<unsigned> > tasks;
-    {
-        progschj::ThreadPool pool(3);
-        for (unsigned i = 0; i < task_count; ++i) {
-            tasks.push_back(pool.enqueue([&, i] {
-                ++counts[i];
-                return i;
-            }));
-        }
+    std::unique_ptr<progschj::ThreadPool> pool(new progschj::ThreadPool(3));
+    auto gate = std::make_shared<Gate>();
+    auto occupied = occupy(*pool, gate, 3);
+    for (unsigned i = 0; i < task_count; ++i) {
+        tasks.push_back(pool->enqueue([&, i] {
+            ++counts[i];
+            return i;
+        }));
     }
+    // Keep every worker busy so all counted tasks are queued at destruction.
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    auto destroying = std::async(std::launch::async, [&] {
+        entered.set_value();
+        pool.reset();
+    });
+    get_ready(started);
+    require_blocked(destroying, "destruction returned with gated and queued work");
+    gate->release();
+    get_ready(destroying);
+    finish(occupied);
     for (unsigned i = 0; i < task_count; ++i) {
         require(counts[i] == 1, "destruction did not drain each task exactly once");
         require(get_ready(tasks[i]) == i, "drained task returned the wrong result");
