@@ -59,6 +59,8 @@ cases. Missing toolchains and unsupported requested modes fail the job rather
 than reducing coverage. Compiler versions and language modes appear in logs.
 Clang 17 uses the installed GCC 13 standard library because GCC 14's C++23
 tuple constraints are incompatible with that compiler.
+An internal result trait works around VS 2015's variadic alias substitution;
+the public `return_type` alias and enqueue signatures are unchanged.
 
 ## Portable behavior suite
 

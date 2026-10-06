@@ -50,14 +50,20 @@ class would_block
 
 
 class ThreadPool {
+    // An intermediate trait avoids VS 2015's incorrect pack expansion when
+    // result_of's function type is substituted directly through an alias.
+    template <typename F, typename... Args>
+    struct task_result :
+#if defined(__cpp_lib_is_invocable) && __cpp_lib_is_invocable >= 201703L
+            std::invoke_result<F&&, Args&&...>
+#else
+            std::result_of<F&& (Args&&...)>
+#endif
+    {};
+
 public:
     template <typename F, typename... Args>
-    using return_type =
-#if defined(__cpp_lib_is_invocable) && __cpp_lib_is_invocable >= 201703L
-            typename std::invoke_result<F&&, Args&&...>::type;
-#else
-            typename std::result_of<F&& (Args&&...)>::type;
-#endif
+    using return_type = typename task_result<F, Args...>::type;
 
     // A zero size requests one worker, matching set_pool_size(0).
     // If startup fails, join any workers already started before propagating
