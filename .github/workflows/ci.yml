@@ -1,0 +1,157 @@
+name: ThreadPool CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: threadpool-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cxx11-gate:
+    name: Linux / GCC 12 / C++11 gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: |
+          g++-12 --version
+          cmake -S tests -B build-11 -G Ninja \
+            -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CXX_STANDARD=11 \
+            -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-11 --parallel 2
+      - name: Test
+        run: ctest --test-dir build-11 --output-on-failure --no-tests=error --parallel 2
+
+  linux:
+    name: Linux / ${{ matrix.compiler }}
+    needs: cxx11-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: g++-12
+            standards: '17 20 23'
+          - compiler: g++-13
+            standards: '11 17 20 23'
+          - compiler: g++-14
+            standards: '11 17 20 23'
+          - compiler: clang++-16
+            standards: '11 17 20 23'
+          - compiler: clang++-17
+            standards: '11 17 20 23'
+          - compiler: clang++-18
+            standards: '11 17 20 23'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test each language mode
+        env:
+          CXX: ${{ matrix.compiler }}
+          STANDARDS: ${{ matrix.standards }}
+        run: |
+          "$CXX" --version
+          for standard in $STANDARDS; do
+            echo "::group::$CXX / C++$standard / Release"
+            cmake -S tests -B "build-$standard" -G Ninja \
+              -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_CXX_STANDARD="$standard" \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build-$standard" --parallel 2
+            ctest --test-dir "build-$standard" --output-on-failure --no-tests=error --parallel 2
+            echo '::endgroup::'
+          done
+
+  windows:
+    name: Windows / ${{ matrix.toolset }} / ${{ matrix.compiler }}
+    needs: cxx11-gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            toolset: v140
+            compiler: MSVC
+            standards: '14'
+          - os: windows-2022
+            toolset: v141
+            compiler: MSVC
+            standards: '14 17'
+          - os: windows-2022
+            toolset: v142
+            compiler: MSVC
+            standards: '14 17 20'
+          - os: windows-2022
+            toolset: v143
+            compiler: MSVC
+            standards: '14 17 20 23'
+          - os: windows-2025-vs2026
+            toolset: v145
+            compiler: MSVC
+            standards: '14 17 20 23'
+          - os: windows-2022
+            toolset: v143
+            compiler: Clang
+            standards: '14 17 20 23'
+          - os: windows-2025-vs2026
+            toolset: v145
+            compiler: Clang
+            standards: '14 17 20 23'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select the Visual Studio toolchain
+        shell: pwsh
+        env:
+          TOOLSET: ${{ matrix.toolset }}
+          COMPILER: ${{ matrix.compiler }}
+        run: ./tests/setup-windows.ps1 -Toolset $env:TOOLSET -Compiler $env:COMPILER
+      - name: Build and test each language mode
+        shell: pwsh
+        env:
+          STANDARDS: ${{ matrix.standards }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($standard in $env:STANDARDS.Split(' ')) {
+            Write-Output "::group::$env:CXX / C++$standard / Release"
+            cmake -S tests -B "build-$standard" -G Ninja `
+              "-DCMAKE_CXX_COMPILER=$env:CXX" "-DCMAKE_CXX_STANDARD=$standard" `
+              -DCMAKE_BUILD_TYPE=Release
+            if ($LASTEXITCODE -ne 0) { throw "C++$standard configuration failed" }
+            cmake --build "build-$standard" --parallel 2
+            if ($LASTEXITCODE -ne 0) { throw "C++$standard build failed" }
+            ctest --test-dir "build-$standard" --output-on-failure --no-tests=error --parallel 2
+            if ($LASTEXITCODE -ne 0) { throw "C++$standard tests failed" }
+            Write-Output '::endgroup::'
+          }
+
+  macos:
+    name: macOS / Apple Clang / Xcode 16.4
+    needs: cxx11-gate
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test each language mode
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+        run: |
+          compiler="$(xcrun --find clang++)"
+          "$compiler" --version
+          for standard in 11 17 20 23; do
+            echo "::group::Apple Clang / C++$standard / Release"
+            cmake -S tests -B "build-$standard" -G Ninja \
+              -DCMAKE_CXX_COMPILER="$compiler" -DCMAKE_CXX_STANDARD="$standard" \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build-$standard" --parallel 2
+            ctest --test-dir "build-$standard" --output-on-failure --no-tests=error --parallel 2
+            echo '::endgroup::'
+          done
