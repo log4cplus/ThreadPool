@@ -82,9 +82,9 @@ if ($Compiler -eq 'Clang') {
     if ($LASTEXITCODE -ne 0) { throw 'clang-cl version discovery failed' }
 } else {
     $cxx = (Get-Command cl.exe -ErrorAction Stop).Source
-    # cl prints its version with no input and returns 2 for the missing source.
+    # cl prints its version with no input; toolsets return either 0 or 2.
     & $cxx
-    if ($LASTEXITCODE -ne 2) { throw 'MSVC compiler discovery failed' }
+    if ($LASTEXITCODE -notin @(0, 2)) { throw 'MSVC compiler discovery failed' }
     $global:LASTEXITCODE = 0
 }
 $env:CXX = $cxx

@@ -55,6 +55,8 @@ The matrix does not repeat GCC 12/C++11 after the gate. Windows and macOS run
 the 14 portable cases; all Linux compiler jobs also run the 31 interposition
 cases. Missing toolchains and unsupported requested modes fail the job rather
 than reducing coverage. Compiler versions and language modes appear in logs.
+Clang 17 uses the installed GCC 13 standard library because GCC 14's C++23
+tuple constraints are incompatible with that compiler.
 
 ## Portable behavior suite
 

@@ -49,6 +49,8 @@ jobs:
             standards: '11 17 20 23'
           - compiler: clang++-17
             standards: '11 17 20 23'
+            # Clang 17 rejects libstdc++ 14's C++23 tuple constraints.
+            cxxflags: --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
           - compiler: clang++-18
             standards: '11 17 20 23'
     steps:
@@ -56,6 +58,7 @@ jobs:
       - name: Build and test each language mode
         env:
           CXX: ${{ matrix.compiler }}
+          CXXFLAGS: ${{ matrix.cxxflags || '' }}
           STANDARDS: ${{ matrix.standards }}
         run: |
           "$CXX" --version

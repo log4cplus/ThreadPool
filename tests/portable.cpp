@@ -350,12 +350,26 @@ void shutdown(bool retired)
     task_gate->wait_entered(workers);
     task_gate->release();
     finish(tasks);
+
+    // Start the control thread before gating TLS cleanup. Windows runs C++ TLS
+    // destructors under the loader lock, which can also block new thread entry.
+    std::promise<void> begin_destruction;
+    auto begin = begin_destruction.get_future();
+    std::promise<void> control_ready;
+    auto ready = control_ready.get_future();
+    auto destroying = std::async(std::launch::async, [&] {
+        control_ready.set_value();
+        get_ready(begin);
+        pool.reset();
+    });
+    get_ready(ready);
     if (retired) {
         pool->set_pool_size(1);
         state->gate.wait_entered(); // One retired worker is still in TLS cleanup.
     }
-    auto destroying = std::async(std::launch::async, [&] { pool.reset(); });
-    state->gate.wait_entered(workers);
+    begin_destruction.set_value();
+    // Do not wait for both destructors to enter: Windows may serialize them.
+    state->gate.wait_entered();
     require_blocked(destroying, "destruction returned before worker TLS cleanup");
     state->gate.release();
     get_ready(destroying);
