@@ -19,7 +19,7 @@ language standard. MSVC has no C++11 mode: use `CMAKE_CXX_STANDARD=14` for its
 minimum mode, including clang-cl with the MSVC standard library.
 
 On Windows, this PowerShell helper selects an x64 Visual Studio environment,
-installs a missing requested MSVC component, and sets `CXX` to the exact compiler:
+checks the requested toolset, and sets `CXX` to the exact compiler:
 
 ```powershell
 ./tests/setup-windows.ps1 -Toolset v143 -Compiler MSVC
@@ -28,12 +28,12 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure --no-tests=error --parallel 2
 ```
 
-The helper accepts `v140`, `v141`, `v142`, `v143`, and `v145`; select `Clang`
+The helper accepts `v142`, `v143`, and `v145`; select `Clang`
 instead of `MSVC` to use the bundled Visual Studio clang-cl. It expects Visual
-Studio 2022 for v140-v143 or Visual Studio 2026 for v145. C++23 on native MSVC
+Studio 2022 for v142/v143 or Visual Studio 2026 for v145. C++23 on native MSVC
 requires `/std:c++23preview`; configuration fails if the switch is unsupported.
-The v140 environment selects Windows SDK 10.0.19041.0, installing it if needed;
-newer SDK headers use compiler intrinsics that toolset does not support.
+The helper only selects preinstalled compilers and the default installed SDK;
+it does not download or install Visual Studio components.
 
 ## Continuous integration
 
@@ -45,13 +45,17 @@ tests its language modes in separate directories, using Release throughout:
 | Platform | Compiler | Language modes |
 | --- | --- | --- |
 | Ubuntu 24.04 x64 | GCC 12, 13, 14; Clang 16, 17, 18 | C++11, 17, 20, 23 |
-| Windows Server 2022 x64 | MSVC v140 | C++14 minimum |
-| Windows Server 2022 x64 | MSVC v141 | C++14 minimum, 17 |
 | Windows Server 2022 x64 | MSVC v142 | C++14 minimum, 17, 20 |
 | Windows Server 2022 x64 | MSVC v143 | C++14 minimum, 17, 20, 23 preview |
 | Windows Server 2025 x64 / VS 2026 | MSVC v145 | C++14 minimum, 17, 20, 23 preview |
 | Both Windows images | Bundled Visual Studio clang-cl | C++14 minimum, 17, 20, 23 |
 | macOS 15 ARM64 / Xcode 16.4 | Apple Clang | C++11, 17, 20, 23 |
+
+CI uses only toolchains preinstalled in the GitHub-hosted runner images. The
+[Windows 2022 image inventory](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md)
+includes v142, v143, and bundled clang-cl; v140 and v141 are outside this matrix.
+The [Visual Studio 2026 image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-VS2026-Readme.md)
+provides v145 and its bundled clang-cl.
 
 The matrix does not repeat GCC 12/C++11 after the gate. Windows and macOS run
 the 14 portable cases; all Linux compiler jobs also run the 31 interposition

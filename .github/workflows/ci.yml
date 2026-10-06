@@ -76,19 +76,11 @@ jobs:
     name: Windows / ${{ matrix.toolset }} / ${{ matrix.compiler }}
     needs: cxx11-gate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-2022
-            toolset: v140
-            compiler: MSVC
-            standards: '14'
-          - os: windows-2022
-            toolset: v141
-            compiler: MSVC
-            standards: '14 17'
           - os: windows-2022
             toolset: v142
             compiler: MSVC

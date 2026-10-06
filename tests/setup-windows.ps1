@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('v140', 'v141', 'v142', 'v143', 'v145')]
+    [ValidateSet('v142', 'v143', 'v145')]
     [string]$Toolset,
     [Parameter(Mandatory)]
     [ValidateSet('MSVC', 'Clang')]
@@ -8,8 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$installerDirectory = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-$vswhere = Join-Path $installerDirectory 'vswhere.exe'
+$vswhere = Join-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer" 'vswhere.exe'
 $versionRange = if ($Toolset -eq 'v145') { '[18.0,19.0)' } else { '[17.0,18.0)' }
 $installation = & $vswhere -latest -products '*' -version $versionRange -property installationPath
 if ($LASTEXITCODE -ne 0 -or -not $installation) {
@@ -17,60 +16,32 @@ if ($LASTEXITCODE -ne 0 -or -not $installation) {
 }
 
 $component = switch ($Toolset) {
-    'v140' { 'Microsoft.VisualStudio.Component.VC.140' }
-    'v141' { 'Microsoft.VisualStudio.Component.VC.v141.x86.x64' }
     'v142' { 'Microsoft.VisualStudio.ComponentGroup.VC.Tools.142.x86.x64' }
     default { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
 }
-$components = @($component)
-$sdkVersion = ''
-if ($Toolset -eq 'v140') {
-    # Newer UCRT headers use intrinsics unavailable in the VS 2015 compiler.
-    $sdkVersion = '10.0.19041.0'
-    $components += 'Microsoft.VisualStudio.Component.Windows10SDK.19041'
-}
 $installed = & $vswhere -latest -products '*' -version $versionRange `
-    -requires $components -property installationPath
+    -requires $component -property installationPath
 if ($LASTEXITCODE -ne 0) { throw 'Visual Studio component discovery failed' }
 if ($installed -ne $installation) {
-    Write-Output "Installing $($components -join ', ') in $installation"
-    $setup = Join-Path $installerDirectory 'setup.exe'
-    $arguments = @('modify', '--installPath', "`"$installation`"", '--quiet', '--norestart')
-    foreach ($requiredComponent in $components) {
-        $arguments += @('--add', $requiredComponent)
-    }
-    $process = Start-Process $setup -Wait -PassThru -ArgumentList $arguments
-    if ($process.ExitCode -notin @(0, 3010)) {
-        throw "Visual Studio component installation failed: $($process.ExitCode)"
-    }
-    $installed = & $vswhere -latest -products '*' -version $versionRange `
-        -requires $components -property installationPath
-    if ($LASTEXITCODE -ne 0 -or $installed -ne $installation) {
-        throw "The requested $Toolset component is still missing"
-    }
+    throw "The requested $Toolset component is not preinstalled"
 }
 
-if ($Toolset -eq 'v140') {
-    $toolsVersion = '14.0'
-} else {
-    $pattern = switch ($Toolset) {
-        'v141' { '^14\.1[0-9]\.' }
-        'v142' { '^14\.2[0-9]\.' }
-        'v143' { '^14\.(3[0-9]|4[0-9])\.' }
-        'v145' { '^14\.5[0-9]\.' }
-    }
-    $tools = Get-ChildItem (Join-Path $installation 'VC\Tools\MSVC') -Directory |
-        Where-Object { $_.Name -match $pattern } |
-        Sort-Object { [version]$_.Name } -Descending |
-        Select-Object -First 1
-    if (-not $tools) { throw "No compiler version matching $Toolset was installed" }
-    $toolsVersion = $tools.Name
+$pattern = switch ($Toolset) {
+    'v142' { '^14\.2[0-9]\.' }
+    'v143' { '^14\.(3[0-9]|4[0-9])\.' }
+    'v145' { '^14\.5[0-9]\.' }
 }
+$tools = Get-ChildItem (Join-Path $installation 'VC\Tools\MSVC') -Directory |
+    Where-Object { $_.Name -match $pattern } |
+    Sort-Object { [version]$_.Name } -Descending |
+    Select-Object -First 1
+if (-not $tools) { throw "No preinstalled compiler version matches $Toolset" }
+$toolsVersion = $tools.Name
 
 $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvarsall.bat'
-Write-Output "Visual Studio: $installation; toolset: $Toolset ($toolsVersion); target: x64; SDK: $sdkVersion"
+Write-Output "Visual Studio: $installation; toolset: $Toolset ($toolsVersion); target: x64"
 $originalEnvironment = [Environment]::GetEnvironmentVariables('Process')
-$environment = & $env:ComSpec /d /s /c "`"$vcvars`" x64 $sdkVersion -vcvars_ver=$toolsVersion >nul && set"
+$environment = & $env:ComSpec /d /s /c "`"$vcvars`" x64 -vcvars_ver=$toolsVersion >nul && set"
 if ($LASTEXITCODE -ne 0) { throw 'Visual Studio environment setup failed' }
 foreach ($line in $environment) {
     if ($line -match '^([^=]+)=(.*)$') {
