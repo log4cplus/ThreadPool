@@ -35,6 +35,7 @@
 #include <future>
 #include <atomic>
 #include <functional>
+#include <type_traits>
 #include <stdexcept>
 #include <algorithm>
 #include <cassert>
